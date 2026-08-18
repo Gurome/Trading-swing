@@ -37,6 +37,29 @@ streamlit run app.py
 Se abre en el navegador (http://localhost:8501). En el celular de la misma
 red WiFi: usa la IP que muestra la terminal (Network URL).
 
+
+## Novedades v2 (4 pestañas)
+
+- **🚦 Señal** — el semáforo original con SL/TP, tamaño y backtest del
+  instrumento seleccionado.
+- **💼 Mis Posiciones** — registra tus compras/ventas reales (ticker,
+  dirección, fecha, precio, unidades; SL/TP automáticos con el ATR de tu
+  fecha de entrada o manuales). La app las vigila en vivo y recomienda:
+  🔴 CERRAR YA (stop tocado) · 🟢 TOMAR GANANCIA (objetivo 1:2 cumplido) ·
+  🟠 CERRAR (cruce de SMA10 en contra) · 🟡 ASEGURAR (subir stop, RSI
+  extremo) · 🟢 MANTENER (con trailing stop sugerido de 1.5×ATR).
+  Importante: en Streamlit Cloud gratuito el archivo de posiciones puede
+  borrarse al reiniciar la app — usa los botones de respaldo/restauración
+  JSON. En tu computadora persiste siempre.
+- **🏆 Comparador** — corre el backtest de la estrategia sobre varios
+  instrumentos a la vez y los rankea por desempeño de los últimos 12 meses
+  (además del histórico completo, % acierto, profit factor y drawdown).
+  Se actualiza solo con cada vela nueva.
+- **📐 Patrones** — detección heurística de hombro-cabeza-hombro (y su
+  inverso), doble techo/suelo, banderas, gallardetes y triángulos sobre
+  gráfico de velas interactivo, con estado (en formación / confirmado) y
+  objetivo teórico. Es análisis complementario, no señal operativa.
+
 ## Rutina (idéntica a la de las hojas)
 
 - **Semanal/Quincenal:** abrir la app el fin de semana, leer el semáforo,

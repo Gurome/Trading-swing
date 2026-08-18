@@ -230,3 +230,240 @@ def backtest(df: pd.DataFrame, capital: float = 5000.0) -> BacktestResult:
 
     res.equity = pd.Series(eq, index=eq_idx, name="Capital")
     return res
+
+
+# ====================================================================
+# ASESOR DE SALIDA para posiciones reales del usuario
+# ====================================================================
+
+def initial_levels_at(df: pd.DataFrame, entry_date, entry_price: float,
+                      direction: str):
+    """SL/TP según el ATR de la última vela cerrada antes de la entrada."""
+    prev = df[df.index <= pd.Timestamp(entry_date)]
+    ref = prev.iloc[-1] if len(prev) else df.iloc[-1]
+    atr = float(ref.ATR) if not pd.isna(ref.ATR) else float(df["ATR"].dropna().iloc[-1])
+    sl, tp = levels(entry_price, atr, direction)
+    return sl, tp, atr
+
+
+def evaluate_position(pos: dict, df: pd.DataFrame, live_price: float) -> dict:
+    """Evalúa una posición abierta contra la última vela CERRADA y el precio
+    vivo. Devuelve recomendación jerárquica basada en las reglas de la
+    estrategia + trailing stop de 1.5×ATR para dejar correr la ganancia.
+
+    Nota honesta: ningún sistema conoce el punto de MÁXIMA ganancia por
+    adelantado; el trailing stop es la aproximación práctica — captura la
+    mayor parte de la tendencia y cede el último tramo a cambio de no
+    devolver todo en un giro.
+    """
+    last = df.iloc[-1]
+    d, e, u = pos["direccion"], float(pos["entrada"]), float(pos["unidades"])
+    sl, tp = float(pos["sl"]), float(pos["tp"])
+    atr, sma10, rsi = float(last.ATR), float(last.SMA10), float(last.RSI)
+    sign = 1 if d == "LARGO" else -1
+    pnl = (live_price - e) * sign * u
+    pnl_pct = (live_price - e) / e * sign
+    profit_atr = (live_price - e) * sign / atr if atr else 0.0
+
+    # trailing stop sugerido (solo se mueve a favor, nunca en contra)
+    if d == "LARGO":
+        trail = max(sl, float(last.Close) - SL_ATR * atr)
+    else:
+        trail = min(sl, float(last.Close) + SL_ATR * atr)
+
+    if (d == "LARGO" and live_price <= sl) or (d == "CORTO" and live_price >= sl):
+        rec, motivo = "🔴 CERRAR YA", "Stop loss alcanzado. Salir protege el capital; no esperar rebotes."
+    elif (d == "LARGO" and live_price >= tp) or (d == "CORTO" and live_price <= tp):
+        rec, motivo = "🟢 TOMAR GANANCIA", "Objetivo 3×ATR alcanzado (ratio 1:2 cumplido). Cerrar, o cerrar la mitad y dejar el resto con el trailing stop."
+    elif (d == "LARGO" and float(last.Close) < sma10) or (d == "CORTO" and float(last.Close) > sma10):
+        rec, motivo = "🟠 CERRAR", "Salida técnica: la última vela cerrada cruzó la SMA10 en contra. La tendencia que justificaba la posición se enfrió."
+    elif profit_atr >= 2 and ((d == "LARGO" and rsi >= 70) or (d == "CORTO" and rsi <= 30)):
+        rec, motivo = "🟡 ASEGURAR", f"Ganancia de {profit_atr:.1f}×ATR con RSI extremo ({rsi:.0f}): movimiento estirado. Sube el stop al trailing (${trail:,.2f}) o toma parcial."
+    elif profit_atr >= 1:
+        rec, motivo = "🟢 MANTENER", f"Tendencia intacta y ganancia ≥1×ATR. Mueve el stop a ${trail:,.2f} (trailing 1.5×ATR) para asegurar sin cortar el recorrido."
+    else:
+        rec, motivo = "🟢 MANTENER", "Tendencia intacta, sin condición de salida. El SL original sigue vigente; dejar trabajar la posición."
+
+    return {"recomendacion": rec, "motivo": motivo, "pnl": pnl,
+            "pnl_pct": pnl_pct, "profit_atr": profit_atr,
+            "stop_sugerido": trail, "sl": sl, "tp": tp,
+            "vela_cerrada": df.index[-1]}
+
+
+# ====================================================================
+# COMPARADOR de instrumentos (backtest multi-ticker)
+# ====================================================================
+
+def compare_instruments(datasets: dict, timeframe: str,
+                        capital: float = 5000.0,
+                        recent_months: int = 12) -> pd.DataFrame:
+    """datasets: {ticker: daily DataFrame}. Corre el backtest completo y el
+    de los últimos `recent_months` meses para cada ticker y devuelve una
+    tabla ordenada por resultado reciente."""
+    rows = []
+    for tk, daily in datasets.items():
+        candles = resample_ohlc(daily, timeframe)
+        candles = drop_open_candle(candles, pd.Timestamp.now(tz="UTC"))
+        df = add_indicators(candles).dropna(subset=["ATR"])
+        if len(df) < 40:
+            continue
+        full = backtest(df, capital).metrics(capital)
+        corte = df.index[-1] - pd.DateOffset(months=recent_months)
+        df_rec = df[df.index >= corte]
+        rec = backtest(df_rec, capital).metrics(capital) if len(df_rec) > 10 else full
+        pf = (full["gan_media"] * full["ganadoras"]) / abs(
+            full["perd_media"] * full["perdedoras"]) if full["perdedoras"] and full["perd_media"] else float("nan")
+        rows.append({
+            "Ticker": tk, "Ops": full["operaciones"],
+            "Acierto": full["acierto"], "Neto %": full["neto_pct"],
+            f"Neto % {recent_months}m": rec["neto_pct"],
+            "Profit factor": pf,
+            "Máx DD %": full["max_drawdown"] / capital,
+        })
+    out = pd.DataFrame(rows)
+    if len(out):
+        out = out.sort_values(f"Neto % {recent_months}m", ascending=False)
+    return out
+
+
+# ====================================================================
+# PATRONES CHARTISTAS (heurísticos, sobre pivotes)
+# ====================================================================
+
+def _pivots(df: pd.DataFrame, window: int = 3):
+    """Pivotes locales: (posición, 'H'/'L', precio), alternados."""
+    highs, lows = df["High"].values, df["Low"].values
+    raw = []
+    for i in range(window, len(df) - window):
+        if highs[i] >= highs[i - window:i + window + 1].max():
+            raw.append((i, "H", float(highs[i])))
+        if lows[i] <= lows[i - window:i + window + 1].min():
+            raw.append((i, "L", float(lows[i])))
+    raw.sort(key=lambda p: p[0])
+    out = []
+    for p in raw:
+        if out and out[-1][1] == p[1]:
+            if (p[1] == "H" and p[2] >= out[-1][2]) or \
+               (p[1] == "L" and p[2] <= out[-1][2]):
+                out[-1] = p
+        else:
+            out.append(p)
+    return out
+
+
+def detect_patterns(df: pd.DataFrame, lookback: int = 120,
+                    tol: float = 0.05, pivot_window: int = 3) -> list:
+    """Detección heurística de patrones clásicos en las últimas `lookback`
+    velas: hombro-cabeza-hombro (y su inverso), doble techo/suelo,
+    banderas/gallardetes y triángulos. Devuelve lista de dicts, del más
+    reciente al más antiguo. Educativo: los patrones chartistas son
+    subjetivos y esta detección automática es una aproximación."""
+    tail = df.iloc[-lookback:].copy()
+    idx = tail.index
+    close = tail["Close"].values
+    atr = float(tail["ATR"].dropna().iloc[-1]) if "ATR" in tail else \
+        float((tail["High"] - tail["Low"]).mean())
+    piv = _pivots(tail, pivot_window)
+    found = []
+
+    def add(nombre, sesgo, estado, detalle, i0, i1, nivel=None):
+        found.append({"patron": nombre, "sesgo": sesgo, "estado": estado,
+                      "detalle": detalle, "desde": idx[i0], "hasta": idx[i1],
+                      "nivel": nivel, "_pos": i1})
+
+    # --- HCH y HCH invertido (secuencias de 5 pivotes) ---
+    for j in range(len(piv) - 4):
+        seq = piv[j:j + 5]
+        tipos = "".join(p[1] for p in seq)
+        if tipos == "HLHLH":
+            h1, t1, h2, t2, h3 = (p[2] for p in seq)
+            if h2 > h1 and h2 > h3 and abs(h1 - h3) <= tol * h2 \
+                    and min(h1, h3) > max(t1, t2):
+                neck = (t1 + t2) / 2
+                conf = close[-1] < neck
+                add("Hombro-Cabeza-Hombro", "bajista",
+                    "CONFIRMADO (rompió el cuello)" if conf else "en formación",
+                    f"Cabeza {h2:,.2f}, hombros {h1:,.2f}/{h3:,.2f}, "
+                    f"cuello ≈ {neck:,.2f}. Objetivo teórico: "
+                    f"{neck - (h2 - neck):,.2f}.",
+                    seq[0][0], seq[4][0], neck)
+        elif tipos == "LHLHL":
+            l1, p1_, l2, p2_, l3 = (p[2] for p in seq)
+            if l2 < l1 and l2 < l3 and abs(l1 - l3) <= tol * max(l1, l3) \
+                    and max(l1, l3) < min(p1_, p2_):
+                neck = (p1_ + p2_) / 2
+                conf = close[-1] > neck
+                add("HCH invertido", "alcista",
+                    "CONFIRMADO (rompió el cuello)" if conf else "en formación",
+                    f"Cabeza {l2:,.2f}, hombros {l1:,.2f}/{l3:,.2f}, "
+                    f"cuello ≈ {neck:,.2f}. Objetivo teórico: "
+                    f"{neck + (neck - l2):,.2f}.",
+                    seq[0][0], seq[4][0], neck)
+
+    # --- doble techo / doble suelo (secuencias de 3 pivotes) ---
+    for j in range(len(piv) - 2):
+        seq = piv[j:j + 3]
+        tipos = "".join(p[1] for p in seq)
+        if tipos == "HLH":
+            h1, t, h2 = (p[2] for p in seq)
+            if abs(h1 - h2) <= 0.03 * h1 and min(h1, h2) - t >= 0.03 * t:
+                conf = close[-1] < t
+                add("Doble techo", "bajista",
+                    "CONFIRMADO (rompió el valle)" if conf else "en formación",
+                    f"Techos {h1:,.2f}/{h2:,.2f}, valle {t:,.2f}.",
+                    seq[0][0], seq[2][0], t)
+        elif tipos == "LHL":
+            l1, p_, l2 = (p[2] for p in seq)
+            if abs(l1 - l2) <= 0.03 * l1 and p_ - max(l1, l2) >= 0.03 * p_:
+                conf = close[-1] > p_
+                add("Doble suelo", "alcista",
+                    "CONFIRMADO (rompió el pico)" if conf else "en formación",
+                    f"Suelos {l1:,.2f}/{l2:,.2f}, pico {p_:,.2f}.",
+                    seq[0][0], seq[2][0], p_)
+
+    # --- bandera / gallardete (asta fuerte + consolidación corta) ---
+    POLE, CONS = 10, 6
+    if len(tail) >= POLE + CONS + 1:
+        pole_move = close[-CONS - 1] - close[-POLE - CONS]
+        cons = tail.iloc[-CONS:]
+        cons_range = float(cons["High"].max() - cons["Low"].min())
+        drift = abs(close[-1] - close[-CONS])
+        if abs(pole_move) >= 3 * atr and cons_range <= 0.5 * abs(pole_move) \
+                and drift <= 0.4 * abs(pole_move):
+            half = CONS // 2
+            r1 = float(cons["High"].iloc[:half].max() - cons["Low"].iloc[:half].min())
+            r2 = float(cons["High"].iloc[half:].max() - cons["Low"].iloc[half:].min())
+            nombre = "Gallardete" if r1 > 1.3 * r2 else "Bandera"
+            sesgo = "alcista" if pole_move > 0 else "bajista"
+            add(f"{nombre} {sesgo}", sesgo, "en formación",
+                f"Asta de {abs(pole_move):,.2f} ({abs(pole_move)/atr:.1f}×ATR) y "
+                f"consolidación estrecha. Suele continuar en la dirección del "
+                f"asta al romper.",
+                len(tail) - POLE - CONS, len(tail) - 1)
+
+    # --- triángulos (pendientes de máximos y mínimos, últimas 20 velas) ---
+    win = min(20, len(tail))
+    seg = tail.iloc[-win:]
+    ph = [(p[0], p[2]) for p in _pivots(seg, 2) if p[1] == "H"]
+    pl = [(p[0], p[2]) for p in _pivots(seg, 2) if p[1] == "L"]
+    if len(ph) >= 2 and len(pl) >= 2:
+        import numpy as np
+        sh = np.polyfit([p[0] for p in ph], [p[1] for p in ph], 1)[0] / atr
+        slo = np.polyfit([p[0] for p in pl], [p[1] for p in pl], 1)[0] / atr
+        nombre = None
+        if sh < -0.05 and slo > 0.05:
+            nombre, sesgo = "Triángulo simétrico", "neutral (rompe hacia cualquier lado)"
+        elif abs(sh) <= 0.05 and slo > 0.05:
+            nombre, sesgo = "Triángulo ascendente", "alcista"
+        elif sh < -0.05 and abs(slo) <= 0.05:
+            nombre, sesgo = "Triángulo descendente", "bajista"
+        if nombre:
+            add(nombre, sesgo, "en formación",
+                "Rango en contracción: suele anticipar un movimiento fuerte "
+                "al romper. Esperar la ruptura con la vela cerrada.",
+                len(tail) - win, len(tail) - 1)
+
+    found.sort(key=lambda f: f["_pos"], reverse=True)
+    for f in found:
+        f.pop("_pos")
+    return found[:4]
