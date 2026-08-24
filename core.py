@@ -467,3 +467,467 @@ def detect_patterns(df: pd.DataFrame, lookback: int = 120,
     for f in found:
         f.pop("_pos")
     return found[:4]
+
+
+# ====================================================================
+# LABORATORIO: estrategias parametrizables + optimizador con validación
+# ====================================================================
+from dataclasses import dataclass as _dc
+import random as _random
+
+
+@_dc
+class StrategyConfig:
+    """Parámetros de una estrategia. `tipo` define las reglas de entrada:
+      - 'tendencia': la original (medias + banda RSI + MACD opcional)
+      - 'cruce':     cruce simple de medias (fast sobre slow)
+      - 'donchian':  ruptura del canal de N velas (trend-following clásico)
+      - 'pullback':  compra del retroceso dentro de la tendencia
+    La salida es común: SL/TP por ATR + cruce de la media rápida en contra.
+    En 'pullback', rsi_low es el umbral de sobreventa para entrar."""
+    tipo: str = "tendencia"
+    sma_fast: int = 10
+    sma_slow: int = 30
+    rsi_low: float = 50.0
+    rsi_high: float = 70.0
+    usar_macd: bool = True
+    donchian: int = 8
+    sl_atr: float = 1.5
+    tp_atr: float = 3.0
+    riesgo: float = 0.01
+
+    def etiqueta(self) -> str:
+        base = {"tendencia": f"Tendencia SMA{self.sma_fast}/{self.sma_slow} RSI {self.rsi_low:.0f}-{self.rsi_high:.0f}" + (" +MACD" if self.usar_macd else ""),
+                "cruce": f"Cruce SMA{self.sma_fast}/{self.sma_slow}",
+                "donchian": f"Donchian {self.donchian} velas",
+                "pullback": f"Pullback SMA{self.sma_slow} RSI<{self.rsi_low:.0f}"}[self.tipo]
+        return f"{base} · SL {self.sl_atr}×ATR TP {self.tp_atr}×ATR"
+
+
+def prepare(candles: pd.DataFrame, cfg: StrategyConfig) -> pd.DataFrame:
+    df = candles.copy()
+    c = df["Close"]
+    df["SMAf"] = c.rolling(cfg.sma_fast).mean()
+    df["SMAs"] = c.rolling(cfg.sma_slow).mean()
+    ema12 = c.ewm(span=12, adjust=False).mean()
+    ema26 = c.ewm(span=26, adjust=False).mean()
+    df["MACD"] = ema12 - ema26
+    df["Senal"] = df["MACD"].ewm(span=9, adjust=False).mean()
+    delta = c.diff()
+    g = delta.clip(lower=0.0)
+    l = (-delta).clip(lower=0.0)
+    ag = g.ewm(alpha=1 / 14, adjust=False, min_periods=14).mean()
+    al = l.ewm(alpha=1 / 14, adjust=False, min_periods=14).mean()
+    df["RSI"] = 100 - 100 / (1 + ag / al)
+    df.loc[al == 0, "RSI"] = 100.0
+    prev = c.shift(1)
+    tr = pd.concat([df["High"] - df["Low"], (df["High"] - prev).abs(),
+                    (df["Low"] - prev).abs()], axis=1).max(axis=1)
+    df["ATR"] = tr.ewm(alpha=1 / 14, adjust=False, min_periods=14).mean()
+    df["DonH"] = df["High"].shift(1).rolling(cfg.donchian).max()
+    df["DonL"] = df["Low"].shift(1).rolling(cfg.donchian).min()
+    return df
+
+
+def signal_cfg(row, cfg: StrategyConfig) -> str:
+    base = [row.SMAf, row.SMAs, row.RSI, row.ATR]
+    if any(pd.isna(v) for v in base):
+        return "ESPERAR"
+    t = cfg.tipo
+    if t == "tendencia":
+        macd_l = row.MACD > row.Senal if cfg.usar_macd else True
+        macd_c = row.MACD < row.Senal if cfg.usar_macd else True
+        if row.Close > row.SMAs and row.Close > row.SMAf and \
+                cfg.rsi_low < row.RSI < cfg.rsi_high and macd_l:
+            return "LARGO"
+        if row.Close < row.SMAs and row.Close < row.SMAf and \
+                (100 - cfg.rsi_high) < row.RSI < (100 - cfg.rsi_low) and macd_c:
+            return "CORTO"
+    elif t == "cruce":
+        if row.Close > row.SMAf > row.SMAs:
+            return "LARGO"
+        if row.Close < row.SMAf < row.SMAs:
+            return "CORTO"
+    elif t == "donchian":
+        if not pd.isna(row.DonH) and row.Close > row.DonH:
+            return "LARGO"
+        if not pd.isna(row.DonL) and row.Close < row.DonL:
+            return "CORTO"
+    elif t == "pullback":
+        if row.Close > row.SMAs and row.RSI < cfg.rsi_low:
+            return "LARGO"
+        if row.Close < row.SMAs and row.RSI > cfg.rsi_high:
+            return "CORTO"
+    return "ESPERAR"
+
+
+def backtest_cfg(df: pd.DataFrame, cfg: StrategyConfig,
+                 capital: float = 5000.0) -> BacktestResult:
+    """Mismo motor conservador que backtest(), con reglas parametrizadas."""
+    res = BacktestResult()
+    open_trade = None
+    eq, eq_idx = [], []
+    acumulado = capital
+    prev_signal, prev_atr = "ESPERAR", float("nan")
+    for i in range(len(df)):
+        row = df.iloc[i]
+        fecha = df.index[i]
+        if open_trade is not None:
+            t = open_trade
+            motivo, precio = "", None
+            if t.direccion == "LARGO":
+                if row.Low <= t.sl:
+                    motivo, precio = "SL", t.sl
+                elif row.High >= t.tp:
+                    motivo, precio = "TP", t.tp
+                elif not pd.isna(row.SMAf) and row.Close < row.SMAf:
+                    motivo, precio = "Cruce media", row.Close
+            else:
+                if row.High >= t.sl:
+                    motivo, precio = "SL", t.sl
+                elif row.Low <= t.tp:
+                    motivo, precio = "TP", t.tp
+                elif not pd.isna(row.SMAf) and row.Close > row.SMAf:
+                    motivo, precio = "Cruce media", row.Close
+            if motivo:
+                t.fecha_salida, t.salida, t.motivo = fecha, precio, motivo
+                s = 1 if t.direccion == "LARGO" else -1
+                t.resultado = (precio - t.entrada) * s * t.unidades
+                acumulado += t.resultado
+                open_trade = None
+        elif prev_signal in ("LARGO", "CORTO") and not pd.isna(prev_atr) and prev_atr > 0:
+            entrada = float(row.Open)
+            if prev_signal == "LARGO":
+                sl, tp = entrada - cfg.sl_atr * prev_atr, entrada + cfg.tp_atr * prev_atr
+            else:
+                sl, tp = entrada + cfg.sl_atr * prev_atr, entrada - cfg.tp_atr * prev_atr
+            unidades = capital * cfg.riesgo / (cfg.sl_atr * prev_atr)
+            open_trade = Trade(fecha_entrada=fecha, direccion=prev_signal,
+                               entrada=entrada, sl=sl, tp=tp, unidades=unidades)
+            res.trades.append(open_trade)
+            t = open_trade
+            motivo, precio = "", None
+            if t.direccion == "LARGO":
+                if row.Low <= t.sl:
+                    motivo, precio = "SL", t.sl
+                elif row.High >= t.tp:
+                    motivo, precio = "TP", t.tp
+            else:
+                if row.High >= t.sl:
+                    motivo, precio = "SL", t.sl
+                elif row.Low <= t.tp:
+                    motivo, precio = "TP", t.tp
+            if motivo:
+                t.fecha_salida, t.salida, t.motivo = fecha, precio, motivo
+                s = 1 if t.direccion == "LARGO" else -1
+                t.resultado = (precio - t.entrada) * s * t.unidades
+                acumulado += t.resultado
+                open_trade = None
+        prev_signal = signal_cfg(row, cfg)
+        prev_atr = row.ATR
+        eq.append(acumulado)
+        eq_idx.append(fecha)
+    res.equity = pd.Series(eq, index=eq_idx, name="Capital")
+    return res
+
+
+def _anualizado(neto_pct: float, idx) -> float:
+    years = max((idx[-1] - idx[0]).days / 365.25, 0.25)
+    return neto_pct / years
+
+
+def evaluate_config(candles: pd.DataFrame, cfg: StrategyConfig,
+                    capital: float = 5000.0, split: float = 0.7) -> dict:
+    """Backtest con validación temporal: optimiza-mira el primer `split`
+    del histórico (in-sample) y examina el resto (out-of-sample), datos
+    que la búsqueda nunca usó para elegir parámetros. Si una configuración
+    brilla in-sample y fracasa out-of-sample, es sobreajuste, no ventaja."""
+    df = prepare(candles, cfg).dropna(subset=["ATR"])
+    corte = int(len(df) * split)
+    df_is, df_oos = df.iloc[:corte], df.iloc[corte:]
+    m_is = backtest_cfg(df_is, cfg, capital).metrics(capital)
+    m_oos = backtest_cfg(df_oos, cfg, capital).metrics(capital)
+    m_full = backtest_cfg(df, cfg, capital).metrics(capital)
+    a_is = _anualizado(m_is["neto_pct"], df_is.index) if len(df_is) > 5 else 0
+    a_oos = _anualizado(m_oos["neto_pct"], df_oos.index) if len(df_oos) > 5 else 0
+    sobre = a_is > 0.05 and (a_oos < 0.3 * a_is)
+    return {"Estrategia": cfg.etiqueta(), "cfg": cfg,
+            "Anual IS": a_is, "Anual OOS": a_oos,
+            "Ops": m_full["operaciones"], "Acierto": m_full["acierto"],
+            "Máx DD %": m_full["max_drawdown"] / capital,
+            "Sobreajuste": "⚠️ sí" if sobre else "no"}
+
+
+def random_configs(tipos: list, n: int, riesgo: float = 0.01,
+                   seed: int = 42) -> list:
+    rng = _random.Random(seed)
+    cfgs = []
+    for _ in range(n):
+        tipo = rng.choice(tipos)
+        lo = rng.choice([35, 40, 45, 50, 55])
+        cfgs.append(StrategyConfig(
+            tipo=tipo,
+            sma_fast=rng.choice([5, 8, 10, 12, 15]),
+            sma_slow=rng.choice([20, 25, 30, 40, 50]),
+            rsi_low=lo, rsi_high=lo + rng.choice([15, 20, 25, 30]),
+            usar_macd=rng.choice([True, False]),
+            donchian=rng.choice([4, 6, 8, 10, 13]),
+            sl_atr=rng.choice([1.0, 1.5, 2.0, 2.5]),
+            tp_atr=rng.choice([2.0, 2.5, 3.0, 4.0, 5.0]),
+            riesgo=riesgo))
+    # dedupe
+    seen, out = set(), []
+    for c in cfgs:
+        k = (c.tipo, c.sma_fast, c.sma_slow, c.rsi_low, c.rsi_high,
+             c.usar_macd, c.donchian, c.sl_atr, c.tp_atr)
+        if k not in seen:
+            seen.add(k)
+            out.append(c)
+    return out
+
+
+# ====================================================================
+# PATRONES v2: geometría operable + escáner histórico de fiabilidad
+# ====================================================================
+
+def detect_patterns_v2(df: pd.DataFrame, lookback: int = 120,
+                       tol: float = 0.05, pivot_window: int = 3) -> list:
+    """Como detect_patterns, pero cada patrón incluye su plan operativo:
+    nivel_ruptura (dónde confirma), objetivo (proyección geométrica) e
+    invalidacion (dónde el patrón queda negado = stop). Los triángulos no
+    llevan plan (dirección ambigua hasta la ruptura). También marca
+    recien_confirmado si la confirmación ocurrió en la ÚLTIMA vela."""
+    tail = df.iloc[-lookback:].copy()
+    idx = tail.index
+    close = tail["Close"].values
+    atr = float(tail["ATR"].dropna().iloc[-1]) if "ATR" in tail and \
+        tail["ATR"].notna().any() else float((tail["High"] - tail["Low"]).mean())
+    piv = _pivots(tail, pivot_window)
+    found = []
+
+    def cruz(nivel, alcista):
+        """(confirmado_hoy, confirmado_antes) respecto al nivel."""
+        hoy = close[-1] > nivel if alcista else close[-1] < nivel
+        ayer = (close[-2] > nivel if alcista else close[-2] < nivel) \
+            if len(close) > 1 else False
+        return hoy, ayer
+
+    def add(nombre, sesgo, detalle, i0, i1, ruptura, objetivo, invalidacion,
+            alcista):
+        hoy, ayer = cruz(ruptura, alcista)
+        estado = "CONFIRMADO" if hoy else "en formación"
+        found.append({"patron": nombre, "sesgo": sesgo, "estado": estado,
+                      "detalle": detalle, "desde": idx[i0], "hasta": idx[i1],
+                      "nivel": ruptura, "nivel_ruptura": ruptura,
+                      "objetivo": objetivo, "invalidacion": invalidacion,
+                      "alcista": alcista,
+                      "recien_confirmado": hoy and not ayer, "_pos": i1})
+
+    for j in range(len(piv) - 4):
+        seq = piv[j:j + 5]
+        tipos = "".join(p[1] for p in seq)
+        if tipos == "HLHLH":
+            h1, t1, h2, t2, h3 = (p[2] for p in seq)
+            if h2 > h1 and h2 > h3 and abs(h1 - h3) <= tol * h2 \
+                    and min(h1, h3) > max(t1, t2):
+                neck = (t1 + t2) / 2
+                add("Hombro-Cabeza-Hombro", "bajista",
+                    f"Cabeza {h2:,.2f}, cuello ≈ {neck:,.2f}.",
+                    seq[0][0], seq[4][0], neck, neck - (h2 - neck), h3, False)
+        elif tipos == "LHLHL":
+            l1, p1_, l2, p2_, l3 = (p[2] for p in seq)
+            if l2 < l1 and l2 < l3 and abs(l1 - l3) <= tol * max(l1, l3) \
+                    and max(l1, l3) < min(p1_, p2_):
+                neck = (p1_ + p2_) / 2
+                add("HCH invertido", "alcista",
+                    f"Cabeza {l2:,.2f}, cuello ≈ {neck:,.2f}.",
+                    seq[0][0], seq[4][0], neck, neck + (neck - l2), l3, True)
+
+    for j in range(len(piv) - 2):
+        seq = piv[j:j + 3]
+        tipos = "".join(p[1] for p in seq)
+        if tipos == "HLH":
+            h1, t, h2 = (p[2] for p in seq)
+            if abs(h1 - h2) <= 0.03 * h1 and min(h1, h2) - t >= 0.03 * t:
+                add("Doble techo", "bajista",
+                    f"Techos {h1:,.2f}/{h2:,.2f}, valle {t:,.2f}.",
+                    seq[0][0], seq[2][0], t, t - ((h1 + h2) / 2 - t),
+                    max(h1, h2), False)
+        elif tipos == "LHL":
+            l1, p_, l2 = (p[2] for p in seq)
+            if abs(l1 - l2) <= 0.03 * l1 and p_ - max(l1, l2) >= 0.03 * p_:
+                add("Doble suelo", "alcista",
+                    f"Suelos {l1:,.2f}/{l2:,.2f}, pico {p_:,.2f}.",
+                    seq[0][0], seq[2][0], p_, p_ + (p_ - (l1 + l2) / 2),
+                    min(l1, l2), True)
+
+    POLE, CONS = 10, 6
+    if len(tail) >= POLE + CONS + 1:
+        pole_move = close[-CONS - 1] - close[-POLE - CONS]
+        cons = tail.iloc[-CONS:]
+        hi, lo = float(cons["High"].max()), float(cons["Low"].min())
+        drift = abs(close[-1] - close[-CONS])
+        if abs(pole_move) >= 3 * atr and (hi - lo) <= 0.5 * abs(pole_move) \
+                and drift <= 0.4 * abs(pole_move):
+            half = CONS // 2
+            r1 = float(cons["High"].iloc[:half].max() - cons["Low"].iloc[:half].min())
+            r2 = float(cons["High"].iloc[half:].max() - cons["Low"].iloc[half:].min())
+            nombre = "Gallardete" if r1 > 1.3 * r2 else "Bandera"
+            alc = pole_move > 0
+            add(f"{nombre} {'alcista' if alc else 'bajista'}",
+                "alcista" if alc else "bajista",
+                f"Asta de {abs(pole_move)/atr:.1f}×ATR y consolidación "
+                f"{lo:,.2f}-{hi:,.2f}.",
+                len(tail) - POLE - CONS, len(tail) - 1,
+                hi if alc else lo,
+                (hi + abs(pole_move)) if alc else (lo - abs(pole_move)),
+                lo if alc else hi, alc)
+
+    win = min(20, len(tail))
+    seg = tail.iloc[-win:]
+    ph = [(p[0], p[2]) for p in _pivots(seg, 2) if p[1] == "H"]
+    pl = [(p[0], p[2]) for p in _pivots(seg, 2) if p[1] == "L"]
+    if len(ph) >= 2 and len(pl) >= 2:
+        import numpy as np
+        sh = np.polyfit([p[0] for p in ph], [p[1] for p in ph], 1)[0] / atr
+        slo = np.polyfit([p[0] for p in pl], [p[1] for p in pl], 1)[0] / atr
+        nombre = sesgo = None
+        if sh < -0.05 and slo > 0.05:
+            nombre, sesgo = "Triángulo simétrico", "neutral"
+        elif abs(sh) <= 0.05 and slo > 0.05:
+            nombre, sesgo = "Triángulo ascendente", "alcista"
+        elif sh < -0.05 and abs(slo) <= 0.05:
+            nombre, sesgo = "Triángulo descendente", "bajista"
+        if nombre:
+            found.append({"patron": nombre, "sesgo": sesgo,
+                          "estado": "en formación",
+                          "detalle": "Rango en contracción; sin plan "
+                          "operativo hasta la ruptura (dirección ambigua).",
+                          "desde": idx[len(tail) - win],
+                          "hasta": idx[len(tail) - 1], "nivel": None,
+                          "nivel_ruptura": None, "objetivo": None,
+                          "invalidacion": None, "alcista": None,
+                          "recien_confirmado": False,
+                          "_pos": len(tail) - 1})
+
+    found.sort(key=lambda f: f["_pos"], reverse=True)
+    for f in found:
+        f.pop("_pos")
+    return found[:5]
+
+
+def scan_pattern_events(df: pd.DataFrame, lookback: int = 60,
+                        horizon: int = 25, pivot_window: int = 3) -> list:
+    """Recorre el histórico vela a vela usando SOLO información disponible
+    hasta ese momento (sin mirar el futuro). Dispara un evento cuando un
+    patrón confirma: (a) el cierre de la vela actual cruza el nivel de un
+    patrón en formación, o (b) el patrón aparece recién confirmado en la
+    ventana (la maduración del pivote llegó una vela tarde). Entrada en la
+    apertura siguiente a la confirmación, stop en la invalidación, objetivo
+    geométrico; SL prioritario si ambos se tocan en la misma vela
+    (conservador); timeout a `horizon` velas cerrando a mercado."""
+    events = []
+    last_fire = {}
+    for t in range(25, len(df) - 1):
+        win = df.iloc[max(0, t - lookback):t]
+        if len(win) < 20:
+            continue
+        pats = detect_patterns_v2(win, lookback=len(win),
+                                  pivot_window=pivot_window)
+        row = df.iloc[t]
+        for p in pats:
+            nr = p.get("nivel_ruptura")
+            if nr is None:
+                continue
+            alc = p["alcista"]
+            if p["estado"] == "CONFIRMADO":
+                if not p.get("recien_confirmado"):
+                    continue
+                ini_i = t              # confirmó en t-1; entramos en t
+            else:
+                if not (row.Close > nr if alc else row.Close < nr):
+                    continue
+                ini_i = t + 1          # confirma en t; entramos en t+1
+            key = p["patron"]
+            if key in last_fire and t - last_fire[key] < 5:
+                continue
+            last_fire[key] = t
+            if ini_i >= len(df):
+                continue
+            entrada = float(df.iloc[ini_i].Open)
+            stop, obj = float(p["invalidacion"]), float(p["objetivo"])
+            if (alc and entrada <= stop) or (not alc and entrada >= stop):
+                continue  # gap que ya nego el patron
+            salida, motivo = None, "timeout"
+            fin_i = min(ini_i + horizon, len(df))
+            for i in range(ini_i, fin_i):
+                c = df.iloc[i]
+                if alc:
+                    if c.Low <= stop:
+                        salida, motivo = stop, "stop"
+                        break
+                    if c.High >= obj:
+                        salida, motivo = obj, "objetivo"
+                        break
+                else:
+                    if c.High >= stop:
+                        salida, motivo = stop, "stop"
+                        break
+                    if c.Low <= obj:
+                        salida, motivo = obj, "objetivo"
+                        break
+            if salida is None:
+                salida = float(df.iloc[fin_i - 1].Close)
+            riesgo_u = abs(entrada - stop)
+            if riesgo_u <= 0:
+                continue
+            r_mult = ((salida - entrada) if alc else (entrada - salida)) / riesgo_u
+            events.append({"fecha": df.index[t], "patron": p["patron"],
+                           "sesgo": "alcista" if alc else "bajista",
+                           "entrada": entrada, "stop": stop, "objetivo": obj,
+                           "salida": salida, "motivo": motivo,
+                           "R": r_mult})
+    return events
+
+
+def pattern_reliability(df: pd.DataFrame, split: float = 0.7,
+                        capital: float = 5000.0, riesgo: float = 0.005,
+                        pivot_window: int = 3) -> dict:
+    """Fiabilidad histórica de los patrones con validación temporal:
+    resume el cumplimiento en el primer 70% (análisis) y por separado en
+    el 30% final (examen). Devuelve {'eventos', 'resumen', 'equity',
+    'metricas'} — la equity asume riesgo fijo `riesgo` del capital por
+    evento (Estrategia B, la agresiva)."""
+    events = scan_pattern_events(df, pivot_window=pivot_window)
+    corte = df.index[int(len(df) * split)]
+    rows = []
+    for patron in sorted({e["patron"] for e in events}):
+        evs = [e for e in events if e["patron"] == patron]
+        eis = [e for e in evs if e["fecha"] < corte]
+        eoos = [e for e in evs if e["fecha"] >= corte]
+
+        def cumpl(lst):
+            return sum(1 for e in lst if e["motivo"] == "objetivo") / len(lst) \
+                if lst else float("nan")
+        rows.append({"Patrón": patron, "Eventos": len(evs),
+                     "Cumplimiento": cumpl(evs),
+                     "R medio": sum(e["R"] for e in evs) / len(evs),
+                     "Ev. IS": len(eis), "Cumpl. IS": cumpl(eis),
+                     "Ev. OOS": len(eoos), "Cumpl. OOS": cumpl(eoos)})
+    resumen = pd.DataFrame(rows)
+    eq_val, eq_idx, acc = [], [], capital
+    for e in sorted(events, key=lambda x: x["fecha"]):
+        acc += e["R"] * capital * riesgo
+        eq_val.append(acc)
+        eq_idx.append(e["fecha"])
+    equity = pd.Series(eq_val, index=eq_idx, name="Capital")
+    total_r = sum(e["R"] for e in events)
+    metricas = {"eventos": len(events),
+                "cumplimiento": sum(1 for e in events
+                                    if e["motivo"] == "objetivo") / len(events)
+                if events else 0.0,
+                "r_total": total_r,
+                "neto_pct": total_r * riesgo,
+                "corte": corte}
+    return {"eventos": events, "resumen": resumen, "equity": equity,
+            "metricas": metricas}

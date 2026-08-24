@@ -78,8 +78,9 @@ def save_positions(positions: list):
 
 
 st.title("🚦 Semáforo Swing")
-tab_sig, tab_pos, tab_cmp, tab_pat = st.tabs(
-    ["🚦 Señal", "💼 Mis Posiciones", "🏆 Comparador", "📐 Patrones"])
+tab_sig, tab_pos, tab_cmp, tab_pat, tab_lab = st.tabs(
+    ["🚦 Señal", "💼 Posiciones", "🏆 Comparador", "📐 Patrones",
+     "🔬 Laboratorio"])
 
 # ================= PESTAÑA 1: SEÑAL =================
 with tab_sig:
@@ -265,13 +266,13 @@ with tab_cmp:
 
 # ================= PESTAÑA 4: PATRONES =================
 with tab_pat:
-    st.subheader("📐 Patrones chartistas (largo plazo)")
+    st.subheader("📐 Patrones chartistas")
     c1, c2 = st.columns(2)
     tk_pat = c1.selectbox("Instrumento", TICKERS, key="tkpat")
     tf_pat = c2.selectbox("Marco", list(core.TIMEFRAMES), index=0,
                           key="tfpat")
     dfp = candles_with_ind(tk_pat, tf_pat)
-    pats = core.detect_patterns(dfp, lookback=min(120, len(dfp)))
+    pats = core.detect_patterns_v2(dfp, lookback=min(120, len(dfp)))
     tail = dfp.tail(120)
     fig = go.Figure(data=[go.Candlestick(
         x=tail.index, open=tail.Open, high=tail.High,
@@ -285,30 +286,204 @@ with tab_pat:
                       fillcolor="orange", opacity=0.12, line_width=0)
         if p["nivel"]:
             fig.add_hline(y=p["nivel"], line_dash="dot", line_width=1,
-                          annotation_text=f'{p["patron"]}')
+                          annotation_text=p["patron"])
     fig.update_layout(height=420, xaxis_rangeslider_visible=False,
                       margin=dict(l=10, r=10, t=25, b=10),
                       legend=dict(orientation="h"))
     st.plotly_chart(fig, use_container_width=True)
+
+    # ---- 1) Patrón por confirmarse / recién confirmado (lo más reciente) ----
+    st.markdown("#### 🎯 Ahora mismo")
     if not pats:
-        st.info("No detecto patrones clásicos en las últimas ~120 velas. "
-                "La ausencia de patrón también es información: mercado sin "
-                "estructura clara.")
+        st.info("Sin patrones en las últimas ~120 velas. La ausencia de "
+                "estructura también es información.")
     for p in pats:
         emoji = {"alcista": "🟢", "bajista": "🔴"}.get(
-            p["sesgo"].split()[0], "🟡")
+            str(p["sesgo"]).split()[0], "🟡")
         with st.container(border=True):
-            st.markdown(f"**{emoji} {p['patron']}** — sesgo {p['sesgo']} · "
-                        f"*{p['estado']}*")
+            titulo = f"**{emoji} {p['patron']}** — {p['sesgo']}"
+            if p.get("recien_confirmado"):
+                st.markdown(f'<div class="banner {"verde" if p["alcista"] else "rojo"}" '
+                            f'style="font-size:20px;padding:10px;">⚡ '
+                            f'{p["patron"]} CONFIRMADO en la última vela'
+                            f'</div>', unsafe_allow_html=True)
+            else:
+                st.markdown(f"{titulo} · *{p['estado']}*")
             st.write(p["detalle"])
+            if p.get("nivel_ruptura") is not None:
+                entrada = p["nivel_ruptura"]
+                stop = p["invalidacion"]
+                obj = p["objetivo"]
+                rr = abs(obj - entrada) / abs(entrada - stop)
+                g1, g2, g3, g4 = st.columns(4)
+                g1.metric("Confirma en", f"${entrada:,.2f}")
+                g2.metric("Stop (invalidación)", f"${stop:,.2f}")
+                g3.metric("Objetivo", f"${obj:,.2f}")
+                g4.metric("R (beneficio/riesgo)", f"{rr:,.1f}")
+                st.caption("Plan SOLO si confirma con vela cerrada; sin "
+                           "confirmación no hay operación. Estrategia B "
+                           "(agresiva): riesgo sugerido 0.5% del capital, "
+                           "la mitad que el semáforo.")
             st.caption(f"Ventana: {p['desde']:%d/%m/%Y} → "
                        f"{p['hasta']:%d/%m/%Y}")
-    st.caption("Detección heurística sobre pivotes: los patrones chartistas "
-               "son subjetivos y esta identificación automática es una "
-               "aproximación educativa, no una señal operativa. Un patrón "
-               "'en formación' puede deshacerse; espera siempre la "
-               "confirmación (ruptura con vela cerrada) y contrástalo con "
-               "el semáforo antes de decidir.")
+
+    # ---- 2) Fiabilidad histórica con validación 70/30 ----
+    st.markdown("#### 🧪 ¿Qué tan bien cumplen los patrones aquí?")
+    if st.button("Analizar fiabilidad histórica", key="btn_rel"):
+        with st.spinner("Escaneando todo el histórico vela a vela…"):
+            rel = core.pattern_reliability(dfp)
+        m = rel["metricas"]
+        if not m["eventos"]:
+            st.info("El escáner no encontró confirmaciones históricas en "
+                    "este instrumento/marco.")
+        else:
+            r1, r2, r3 = st.columns(3)
+            r1.metric("Confirmaciones", m["eventos"])
+            r2.metric("Cumplieron objetivo", f"{m['cumplimiento']:.0%}")
+            r3.metric("R acumulado", f"{m['r_total']:+.1f}R "
+                      f"({m['neto_pct']:+.1%} al 0.5%)")
+            st.dataframe(rel["resumen"].style.format({
+                "Cumplimiento": "{:.0%}", "R medio": "{:+.2f}",
+                "Cumpl. IS": "{:.0%}", "Cumpl. OOS": "{:.0%}"},
+                na_rep="—"), use_container_width=True, hide_index=True)
+            if len(rel["equity"]):
+                st.line_chart(rel["equity"])
+            st.caption("**Cómo leerlo:** 'Cumpl. IS' es el primer 70% del "
+                       "histórico; 'Cumpl. OOS' el 30% final — el examen "
+                       "con datos nuevos. Un patrón fiable mantiene "
+                       "cumplimiento similar en ambos y R medio positivo. "
+                       "Pocas confirmaciones (<10) = evidencia débil, no "
+                       "concluyas nada. El R acumulado ya descuenta los "
+                       "fallos: es el resultado de operar TODOS los "
+                       "patrones mecánicamente con stop en la invalidación.")
+            st.caption("**Doble estrategia sugerida:** A = semáforo "
+                       "(conservadora, 1% riesgo) como base; B = patrones "
+                       "(agresiva, 0.5% riesgo) solo en los tipos con "
+                       "Cumpl. OOS ≥ 50% y R medio positivo en este "
+                       "instrumento. Si A y B se contradicen en el mismo "
+                       "instrumento (una larga y otra corta), no operes "
+                       "ninguna: el mercado no está claro.")
+    st.caption("Detección heurística sobre pivotes: aproximación educativa, "
+               "no señal infalible. Los pivotes necesitan velas para "
+               "madurar, así que un patrón puede aparecer 1-2 velas "
+               "después de formarse.")
 
 st.caption("⚠️ Herramienta educativa, no asesoría financiera. Datos Yahoo "
            "Finance (precio vivo ±15 min).")
+
+# ================= PESTAÑA 5: LABORATORIO =================
+with tab_lab:
+    st.subheader("🔬 Laboratorio de estrategias")
+    with st.expander("⚠️ Lee esto antes de optimizar (importante)",
+                     expanded=True):
+        st.markdown(
+            "Si pruebas suficientes combinaciones, **siempre** aparecerá "
+            "alguna con un backtest espectacular — igual que si torturas "
+            "los datos, confiesan lo que quieras. Eso se llama "
+            "**sobreajuste** y es la forma #1 en que los traders se "
+            "autoengañan.\n\n"
+            "Por eso este laboratorio divide el histórico en dos: optimiza "
+            "con el primer 70% (**IS**, in-sample) y examina con el 30% "
+            "final (**OOS**, out-of-sample) — datos que la búsqueda nunca "
+            "vio, como un examen con preguntas nuevas. **La columna que "
+            "importa es 'Anual OOS'**; una estrategia que brilla en IS y "
+            "fracasa en OOS lleva la bandera ⚠️ de sobreajuste.\n\n"
+            "Honestidad: un 30% anual *sostenido* es rendimiento de élite "
+            "mundial. Si aparece aquí un 30% OOS, sospecha primero "
+            "(muestra corta, suerte, un solo mercado) y verifica en otros "
+            "instrumentos y en papel antes de creerlo.")
+    lc1, lc2, lc3 = st.columns(3)
+    tk_lab = lc1.selectbox("Instrumento", TICKERS, key="tklab")
+    tf_lab = lc2.selectbox("Marco", list(core.TIMEFRAMES), key="tflab")
+    riesgo_lab = lc3.select_slider("Riesgo por operación",
+                                   options=[0.005, 0.01, 0.015, 0.02],
+                                   value=0.01,
+                                   format_func=lambda x: f"{x:.1%}")
+    st.caption("El riesgo escala el resultado casi linealmente: 2% de "
+               "riesgo ≈ el doble de retorno **y el doble de drawdown** "
+               "que 1%. No crea ventaja, solo la amplifica — en ambas "
+               "direcciones.")
+    candles_lab = core.resample_ohlc(fetch_daily(tk_lab), tf_lab)
+    candles_lab = core.drop_open_candle(candles_lab,
+                                        pd.Timestamp.now(tz="UTC"))
+    modo = st.radio("Modo", ["Probar una estrategia (manual)",
+                             "Auto-explorar (búsqueda con validación)"],
+                    horizontal=True)
+
+    if modo.startswith("Probar"):
+        tipo = st.selectbox("Tipo de estrategia", [
+            ("tendencia", "Tendencia confirmada (la original)"),
+            ("cruce", "Cruce de medias"),
+            ("donchian", "Ruptura Donchian (canal de N velas)"),
+            ("pullback", "Pullback (comprar el retroceso en tendencia)")],
+            format_func=lambda t: t[1])[0]
+        pc1, pc2, pc3 = st.columns(3)
+        sma_f = pc1.number_input("Media rápida", 3, 30, 10)
+        sma_s = pc2.number_input("Media lenta", 15, 100, 30)
+        don = pc3.number_input("Canal Donchian (velas)", 3, 30, 8)
+        pc4, pc5 = st.columns(2)
+        rsi_band = pc4.slider("Banda RSI (largos)", 20, 90, (50, 70))
+        usar_macd = pc5.checkbox("Exigir confirmación MACD", value=True)
+        pc6, pc7 = st.columns(2)
+        sl_m = pc6.slider("Stop loss (×ATR)", 0.5, 3.0, 1.5, 0.25)
+        tp_m = pc7.slider("Take profit (×ATR)", 1.0, 6.0, 3.0, 0.5)
+        cfg = core.StrategyConfig(
+            tipo=tipo, sma_fast=int(sma_f), sma_slow=int(sma_s),
+            rsi_low=float(rsi_band[0]), rsi_high=float(rsi_band[1]),
+            usar_macd=usar_macd, donchian=int(don),
+            sl_atr=float(sl_m), tp_atr=float(tp_m), riesgo=riesgo_lab)
+        r = core.evaluate_config(candles_lab, cfg, capital=5000)
+        e1, e2, e3 = st.columns(3)
+        e1.metric("Anual IS (70% inicial)", f"{r['Anual IS']:+.1%}")
+        e2.metric("Anual OOS (30% final)", f"{r['Anual OOS']:+.1%}")
+        e3.metric("Sobreajuste", r["Sobreajuste"])
+        e4, e5, e6 = st.columns(3)
+        e4.metric("Operaciones", r["Ops"])
+        e5.metric("% acierto", f"{r['Acierto']:.0%}")
+        e6.metric("Máx drawdown", f"{r['Máx DD %']:.1%}")
+        dfl = core.prepare(candles_lab, cfg).dropna(subset=["ATR"])
+        btl = core.backtest_cfg(dfl, cfg, 5000)
+        if btl.equity is not None and len(btl.equity):
+            st.line_chart(btl.equity)
+        st.caption(f"Config: {cfg.etiqueta()} · riesgo {riesgo_lab:.1%}")
+
+    else:
+        tipos_sel = st.multiselect(
+            "Tipos a explorar",
+            ["tendencia", "cruce", "donchian", "pullback"],
+            default=["tendencia", "cruce", "donchian", "pullback"])
+        n_iter = st.slider("Combinaciones a probar", 30, 300, 100, 10)
+        if st.button("🔬 Buscar", type="primary") and tipos_sel:
+            cfgs = core.random_configs(tipos_sel, n_iter,
+                                       riesgo=riesgo_lab)
+            barra = st.progress(0.0, "Probando configuraciones…")
+            filas = []
+            for i, c in enumerate(cfgs):
+                try:
+                    filas.append(core.evaluate_config(candles_lab, c,
+                                                      capital=5000))
+                except Exception:
+                    pass
+                barra.progress((i + 1) / len(cfgs))
+            barra.empty()
+            tabla = pd.DataFrame(filas).drop(columns="cfg")
+            tabla = tabla[tabla["Ops"] >= 8]  # sin operaciones no hay evidencia
+            tabla = tabla.sort_values("Anual OOS",
+                                      ascending=False).head(15)
+            st.dataframe(tabla.style.format({
+                "Anual IS": "{:+.1%}", "Anual OOS": "{:+.1%}",
+                "Acierto": "{:.0%}", "Máx DD %": "{:.1%}"}),
+                use_container_width=True, hide_index=True)
+            if len(tabla):
+                mejor = tabla.iloc[0]
+                st.success(f"Mejor validada: **{mejor['Estrategia']}** → "
+                           f"{mejor['Anual OOS']:+.1%} anual en datos que "
+                           f"nunca vio (IS {mejor['Anual IS']:+.1%}).")
+                st.caption("Siguiente paso serio: prueba esta config en "
+                           "modo Manual sobre OTROS instrumentos y marcos. "
+                           "Si la ventaja solo existe en un ticker, era "
+                           "ruido. Y aun la mejor: 2-3 meses en papel "
+                           "antes de dinero real. Compara siempre contra "
+                           "tu alternativa sin riesgo (~5% bancario): la "
+                           "estrategia debe pagarte por encima de eso "
+                           "para justificar su riesgo y tu tiempo.")
