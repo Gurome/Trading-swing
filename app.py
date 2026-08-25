@@ -77,6 +77,29 @@ def save_positions(positions: list):
     POS_FILE.write_text(json.dumps(positions, indent=2, default=str))
 
 
+STRAT_FILE = Path(__file__).parent / "strategy.json"
+
+
+def load_strategy():
+    """Estrategia elegida en el Laboratorio; None = la original."""
+    if STRAT_FILE.exists():
+        try:
+            return core.StrategyConfig(**json.loads(STRAT_FILE.read_text()))
+        except Exception:
+            return None
+    return None
+
+
+def save_strategy(cfg):
+    from dataclasses import asdict
+    STRAT_FILE.write_text(json.dumps(asdict(cfg)))
+
+
+def clear_strategy():
+    if STRAT_FILE.exists():
+        STRAT_FILE.unlink()
+
+
 st.title("🚦 Semáforo Swing")
 tab_sig, tab_pos, tab_cmp, tab_pat, tab_lab = st.tabs(
     ["🚦 Señal", "💼 Posiciones", "🏆 Comparador", "📐 Patrones",
@@ -84,18 +107,30 @@ tab_sig, tab_pos, tab_cmp, tab_pat, tab_lab = st.tabs(
 
 # ================= PESTAÑA 1: SEÑAL =================
 with tab_sig:
+    cfg_act = load_strategy()
+    es_custom = cfg_act is not None
+    cfg = cfg_act if es_custom else core.StrategyConfig()
+    if es_custom:
+        ic1, ic2 = st.columns([4, 1])
+        ic1.info(f"🔬 Estrategia del Laboratorio activa: "
+                 f"**{cfg.etiqueta()}** · riesgo {cfg.riesgo:.1%}")
+        if ic2.button("↩️ Volver a la original"):
+            clear_strategy()
+            st.rerun()
     c1, c2 = st.columns(2)
     ticker = c1.selectbox("Instrumento", TICKERS, index=0)
     timeframe = c2.selectbox("Marco temporal", list(core.TIMEFRAMES), index=0)
     capital = st.number_input("Mi capital ($)", min_value=100.0,
                               value=5000.0, step=100.0)
     try:
-        df = candles_with_ind(ticker, timeframe)
+        candles = core.resample_ohlc(fetch_daily(ticker), timeframe)
+        candles = core.drop_open_candle(candles, pd.Timestamp.now(tz="UTC"))
+        df = core.prepare(candles, cfg)
     except Exception as e:
         st.error(f"No pude descargar {ticker}: {e}")
         st.stop()
     last = df.iloc[-1]
-    sig = core.signal(last)
+    sig = core.signal_cfg(last, cfg)
     unidad = core.TIMEFRAMES[timeframe][1]
     pv = live_price(ticker)
     clase = {"LARGO": "verde", "CORTO": "rojo", "ESPERAR": "amarillo"}[sig]
@@ -108,17 +143,20 @@ with tab_sig:
                 f'${pv:,.2f}</div>', unsafe_allow_html=True)
     st.write("")
     if sig in ("LARGO", "CORTO"):
-        sl, tp = core.levels(float(last.Close), float(last.ATR), sig)
-        unids = core.position_size(capital, float(last.ATR))
+        atr = float(last.ATR)
+        if sig == "LARGO":
+            sl, tp = last.Close - cfg.sl_atr * atr, last.Close + cfg.tp_atr * atr
+        else:
+            sl, tp = last.Close + cfg.sl_atr * atr, last.Close - cfg.tp_atr * atr
+        unids = capital * cfg.riesgo / (cfg.sl_atr * atr)
         m1, m2 = st.columns(2)
         m1.metric("Stop Loss", f"${sl:,.2f}")
         m2.metric("Take Profit", f"${tp:,.2f}")
         m3, m4 = st.columns(2)
-        m3.metric("Tamaño (riesgo 1%)",
+        m3.metric(f"Tamaño (riesgo {cfg.riesgo:.1%})",
                   f"{unids:,.1f} unid. (~${unids*last.Close:,.0f})")
         m4.metric("Tiempo estimado",
-                  core.holding_estimate(float(last.Close), tp,
-                                        float(last.ATR), unidad))
+                  core.holding_estimate(float(last.Close), tp, atr, unidad))
         st.caption("Ejecuta en la próxima apertura. Gap >±3-4%: descarta.")
     else:
         st.info("Sin señal: condiciones no alineadas.")
@@ -127,9 +165,12 @@ with tab_sig:
         d1.metric("RSI (14)", f"{last.RSI:,.1f}")
         d2.metric("MACD − Señal", f"{last.MACD-last.Senal:,.2f}")
         d3.metric("ATR (14)", f"${last.ATR:,.2f}")
-        st.line_chart(df[["Close", "SMA10", "SMA30"]].tail(80))
-    with st.expander("🧪 Backtest de este instrumento"):
-        bt = core.backtest(df.dropna(subset=["ATR"]), capital=capital)
+        chart = df[["Close", "SMAf", "SMAs"]].tail(80).rename(columns={
+            "SMAf": f"SMA {cfg.sma_fast}", "SMAs": f"SMA {cfg.sma_slow}"})
+        st.line_chart(chart)
+    with st.expander("🧪 Backtest de este instrumento con esta estrategia"):
+        bt = core.backtest_cfg(df.dropna(subset=["ATR"]), cfg,
+                               capital=capital)
         m = bt.metrics(capital)
         b1, b2, b3 = st.columns(3)
         b1.metric("Operaciones", m["operaciones"])
@@ -272,8 +313,20 @@ with tab_pat:
     tf_pat = c2.selectbox("Marco", list(core.TIMEFRAMES), index=0,
                           key="tfpat")
     dfp = candles_with_ind(tk_pat, tf_pat)
-    pats = core.detect_patterns_v2(dfp, lookback=min(120, len(dfp)))
-    tail = dfp.tail(120)
+    # Detecta sobre suficiente historia para VER la estructura, pero solo
+    # conserva patrones VIGENTES: los que terminan dentro del último mes.
+    pats_all = core.detect_patterns_v2(dfp, lookback=min(120, len(dfp)))
+    corte_rec = dfp.index[-1] - pd.Timedelta(days=30)
+    pats = [p for p in pats_all if p["hasta"] >= corte_rec]
+    # gráfico centrado en lo reciente: última data + el contexto justo
+    # para ver el patrón vigente completo
+    if pats:
+        inicio = min(p["desde"] for p in pats)
+        tail = dfp[dfp.index >= inicio]
+        if len(tail) < 20:
+            tail = dfp.tail(20)
+    else:
+        tail = dfp.tail(20)
     fig = go.Figure(data=[go.Candlestick(
         x=tail.index, open=tail.Open, high=tail.High,
         low=tail.Low, close=tail.Close, name=tk_pat)])
@@ -294,9 +347,13 @@ with tab_pat:
 
     # ---- 1) Patrón por confirmarse / recién confirmado (lo más reciente) ----
     st.markdown("#### 🎯 Ahora mismo")
+    st.caption("Solo se muestran patrones vigentes (que terminan en los "
+               "últimos 30 días). Los antiguos no aparecen aquí: viven en "
+               "el análisis de fiabilidad histórica de abajo.")
     if not pats:
-        st.info("Sin patrones en las últimas ~120 velas. La ausencia de "
-                "estructura también es información.")
+        st.info("Sin patrones vigentes en el último mes. La ausencia de "
+                "estructura también es información: mercado sin figura "
+                "clara ahora mismo.")
     for p in pats:
         emoji = {"alcista": "🟢", "bajista": "🔴"}.get(
             str(p["sesgo"]).split()[0], "🟡")
@@ -446,6 +503,11 @@ with tab_lab:
         if btl.equity is not None and len(btl.equity):
             st.line_chart(btl.equity)
         st.caption(f"Config: {cfg.etiqueta()} · riesgo {riesgo_lab:.1%}")
+        if st.button("✅ Usar esta estrategia en 🚦 Señal", type="primary"):
+            save_strategy(cfg)
+            st.success("Estrategia activada. La pestaña 🚦 Señal ya opera "
+                       "con estas reglas (verás el aviso azul arriba; desde "
+                       "ahí puedes volver a la original).")
 
     else:
         tipos_sel = st.multiselect(
@@ -466,24 +528,42 @@ with tab_lab:
                     pass
                 barra.progress((i + 1) / len(cfgs))
             barra.empty()
+            filas = [f for f in filas if f["Ops"] >= 8]
+            filas.sort(key=lambda f: -f["Anual OOS"])
+            st.session_state["lab_res"] = filas[:15]
+            st.session_state["lab_ctx"] = f"{tk_lab} · {tf_lab}"
+        if st.session_state.get("lab_res"):
+            filas = st.session_state["lab_res"]
+            st.caption(f"Resultados para {st.session_state['lab_ctx']} "
+                       f"(top {len(filas)}, ordenados por Anual OOS)")
             tabla = pd.DataFrame(filas).drop(columns="cfg")
-            tabla = tabla[tabla["Ops"] >= 8]  # sin operaciones no hay evidencia
-            tabla = tabla.sort_values("Anual OOS",
-                                      ascending=False).head(15)
             st.dataframe(tabla.style.format({
                 "Anual IS": "{:+.1%}", "Anual OOS": "{:+.1%}",
                 "Acierto": "{:.0%}", "Máx DD %": "{:.1%}"}),
                 use_container_width=True, hide_index=True)
-            if len(tabla):
-                mejor = tabla.iloc[0]
-                st.success(f"Mejor validada: **{mejor['Estrategia']}** → "
-                           f"{mejor['Anual OOS']:+.1%} anual en datos que "
-                           f"nunca vio (IS {mejor['Anual IS']:+.1%}).")
-                st.caption("Siguiente paso serio: prueba esta config en "
-                           "modo Manual sobre OTROS instrumentos y marcos. "
-                           "Si la ventaja solo existe en un ticker, era "
-                           "ruido. Y aun la mejor: 2-3 meses en papel "
-                           "antes de dinero real. Compara siempre contra "
-                           "tu alternativa sin riesgo (~5% bancario): la "
-                           "estrategia debe pagarte por encima de eso "
-                           "para justificar su riesgo y tu tiempo.")
+            mejor = filas[0]
+            st.success(f"Mejor validada: **{mejor['Estrategia']}** → "
+                       f"{mejor['Anual OOS']:+.1%} anual en datos que "
+                       f"nunca vio (IS {mejor['Anual IS']:+.1%}).")
+            opciones = {f"{f['Estrategia']} · OOS {f['Anual OOS']:+.1%}"
+                        + (" ⚠️" if f["Sobreajuste"] == "⚠️ sí" else ""): f
+                        for f in filas}
+            elegida = st.selectbox("Elegir estrategia para operar",
+                                   list(opciones))
+            if st.button("✅ Usar la elegida en 🚦 Señal", type="primary"):
+                cfg_sel = opciones[elegida]["cfg"]
+                cfg_sel.riesgo = riesgo_lab
+                save_strategy(cfg_sel)
+                st.success("Estrategia activada en 🚦 Señal (aviso azul "
+                           "arriba de esa pestaña; desde ahí vuelves a la "
+                           "original cuando quieras).")
+                if opciones[elegida]["Sobreajuste"] == "⚠️ sí":
+                    st.warning("Elegiste una config con bandera de "
+                               "sobreajuste: su ventaja no sobrevivió al "
+                               "examen OOS. Úsala solo en papel.")
+            st.caption("Siguiente paso serio: prueba la elegida en modo "
+                       "Manual sobre OTROS instrumentos y marcos. Si la "
+                       "ventaja solo existe en un ticker, era ruido. Y aun "
+                       "la mejor: 2-3 meses en papel antes de dinero real. "
+                       "Compárala siempre contra tu ~5% bancario sin "
+                       "riesgo.")
